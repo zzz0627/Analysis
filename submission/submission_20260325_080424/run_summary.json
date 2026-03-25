@@ -1,0 +1,65 @@
+{
+  "timestamp": "20260325_080424",
+  "config": {
+    "train_path": "dataset/train.csv",
+    "test_path": "dataset/test.csv",
+    "sample_path": "dataset/submission.csv",
+    "output_root": "submission",
+    "n_splits": 5,
+    "seed": 42,
+    "use_duration": true,
+    "models": [
+      "catboost",
+      "lightgbm",
+      "xgboost"
+    ],
+    "weight_step": 0.1
+  },
+  "dataset": {
+    "train_shape": [
+      22500,
+      22
+    ],
+    "test_shape": [
+      7500,
+      21
+    ],
+    "positive_rate": 0.1312,
+    "feature_count": 55,
+    "categorical_count": 17,
+    "numeric_count": 38
+  },
+  "model_metrics": {
+    "catboost": {
+      "oof_accuracy": 0.8833333333333333,
+      "best_threshold": 0.45,
+      "mean_fold_accuracy": 0.8848,
+      "std_fold_accuracy": 0.0013079056861832895
+    },
+    "lightgbm": {
+      "oof_accuracy": 0.8842666666666666,
+      "best_threshold": 0.52,
+      "mean_fold_accuracy": 0.8859111111111112,
+      "std_fold_accuracy": 0.002379334900324269
+    },
+    "xgboost": {
+      "oof_accuracy": 0.8844,
+      "best_threshold": 0.53,
+      "mean_fold_accuracy": 0.8858222222222221,
+      "std_fold_accuracy": 0.0030482539021301665
+    }
+  },
+  "ensemble": {
+    "oof_accuracy": 0.8850666666666667,
+    "best_threshold": 0.54,
+    "weights": {
+      "catboost": 0.2,
+      "lightgbm": 0.2,
+      "xgboost": 0.6
+    }
+  },
+  "artifacts": {
+    "submission_path": "submission/submission_20260325_080424/submission.csv",
+    "summary_path": "submission/submission_20260325_080424/run_summary.json"
+  }
+}
