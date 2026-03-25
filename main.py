@@ -60,6 +60,13 @@ class RunConfig:
     use_duration: bool
     models: tuple[str, ...]
     weight_step: float
+    bagging_seeds: tuple[int, ...]
+    export_candidates: bool
+    candidate_rate_multipliers: tuple[float, ...]
+    enable_pseudo_label: bool
+    pseudo_label_low: float
+    pseudo_label_high: float
+    pseudo_label_weight: float
 
 
 def parse_args() -> RunConfig:
@@ -80,8 +87,46 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--weight-step",
         type=float,
-        default=0.1,
+        default=0.05,
         help="Blend weight search step. Smaller is slower but more precise.",
+    )
+    parser.add_argument(
+        "--bagging-seeds",
+        default="42,2024,3407",
+        help="Comma separated seeds used for model bagging.",
+    )
+    parser.add_argument(
+        "--candidate-rate-multipliers",
+        default="0.5,0.75,1.25",
+        help="Comma separated positive-count multipliers for leaderboard probing candidates.",
+    )
+    parser.add_argument(
+        "--disable-candidates",
+        action="store_true",
+        help="Only export the primary submission.csv.",
+    )
+    parser.add_argument(
+        "--disable-pseudo-label",
+        action="store_true",
+        help="Disable the pseudo-label candidate submission.",
+    )
+    parser.add_argument(
+        "--pseudo-label-low",
+        type=float,
+        default=0.02,
+        help="Lower confidence cutoff for pseudo labels.",
+    )
+    parser.add_argument(
+        "--pseudo-label-high",
+        type=float,
+        default=0.98,
+        help="Upper confidence cutoff for pseudo labels.",
+    )
+    parser.add_argument(
+        "--pseudo-label-weight",
+        type=float,
+        default=0.35,
+        help="Training weight assigned to pseudo-labeled rows.",
     )
     parser.add_argument(
         "--drop-duration",
@@ -110,6 +155,38 @@ def parse_args() -> RunConfig:
     if not 0 < args.weight_step <= 1:
         raise ValueError("--weight-step must be in the interval (0, 1].")
 
+    bagging_seeds = tuple(
+        dict.fromkeys(
+            int(seed.strip()) for seed in args.bagging_seeds.split(",") if seed.strip()
+        )
+    )
+    if not bagging_seeds:
+        raise ValueError("At least one bagging seed must be provided.")
+
+    candidate_rate_multipliers = tuple(
+        dict.fromkeys(
+            float(value.strip())
+            for value in args.candidate_rate_multipliers.split(",")
+            if value.strip()
+        )
+    )
+    invalid_multipliers = [
+        value for value in candidate_rate_multipliers if value < 0
+    ]
+    if invalid_multipliers:
+        raise ValueError(
+            f"Candidate positive-count multipliers must be non-negative: {invalid_multipliers}"
+        )
+
+    if not 0 <= args.pseudo_label_low < args.pseudo_label_high <= 1:
+        raise ValueError(
+            "--pseudo-label-low and --pseudo-label-high must satisfy "
+            "0 <= low < high <= 1."
+        )
+
+    if not 0 < args.pseudo_label_weight <= 1:
+        raise ValueError("--pseudo-label-weight must be in the interval (0, 1].")
+
     return RunConfig(
         train_path=Path(args.train_path),
         test_path=Path(args.test_path),
@@ -120,6 +197,13 @@ def parse_args() -> RunConfig:
         use_duration=not args.drop_duration,
         models=models,
         weight_step=args.weight_step,
+        bagging_seeds=bagging_seeds,
+        export_candidates=not args.disable_candidates,
+        candidate_rate_multipliers=candidate_rate_multipliers,
+        enable_pseudo_label=not args.disable_pseudo_label,
+        pseudo_label_low=args.pseudo_label_low,
+        pseudo_label_high=args.pseudo_label_high,
+        pseudo_label_weight=args.pseudo_label_weight,
     )
 
 
@@ -394,6 +478,27 @@ def build_model(
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
+def fit_model(
+    model_name: str,
+    model,
+    X_train: pd.DataFrame,
+    y_train: pd.Series | np.ndarray,
+    categorical_columns: list[str],
+    sample_weight: np.ndarray | None = None,
+) -> None:
+    if model_name == "catboost":
+        fit_kwargs: dict[str, Any] = {"cat_features": categorical_columns}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = sample_weight
+        model.fit(X_train, y_train, **fit_kwargs)
+        return
+
+    fit_kwargs = {}
+    if sample_weight is not None:
+        fit_kwargs["classifier__sample_weight"] = sample_weight
+    model.fit(X_train, y_train, **fit_kwargs)
+
+
 def build_threshold_grid() -> np.ndarray:
     return np.round(np.arange(0.05, 0.951, 0.01), 2)
 
@@ -435,6 +540,15 @@ def generate_weight_combinations(
     return combinations
 
 
+def blend_probabilities(
+    prediction_dict: dict[str, np.ndarray], weights: dict[str, float]
+) -> np.ndarray:
+    blended_predictions = np.zeros_like(next(iter(prediction_dict.values())))
+    for model_name, weight in weights.items():
+        blended_predictions += weight * prediction_dict[model_name]
+    return blended_predictions
+
+
 def search_best_ensemble(
     y_true: np.ndarray,
     model_oof_predictions: dict[str, np.ndarray],
@@ -449,10 +563,7 @@ def search_best_ensemble(
     best_accuracy = -1.0
 
     for weights in weight_candidates:
-        blended_predictions = np.zeros_like(next(iter(model_oof_predictions.values())))
-        for model_name, weight in weights.items():
-            blended_predictions += weight * model_oof_predictions[model_name]
-
+        blended_predictions = blend_probabilities(model_oof_predictions, weights)
         threshold, accuracy = search_best_threshold(y_true, blended_predictions, thresholds)
         if accuracy > best_accuracy:
             best_accuracy = accuracy
@@ -465,24 +576,21 @@ def search_best_ensemble(
 def run_cross_validation(
     X: pd.DataFrame,
     y: pd.Series,
-    X_test: pd.DataFrame,
     categorical_columns: list[str],
     numeric_columns: list[str],
     config: RunConfig,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
     splitter = StratifiedKFold(
         n_splits=config.n_splits, shuffle=True, random_state=config.seed
     )
     thresholds = build_threshold_grid()
 
     oof_predictions: dict[str, np.ndarray] = {}
-    test_predictions: dict[str, np.ndarray] = {}
     metrics: dict[str, dict[str, Any]] = {}
 
     for model_name in config.models:
         print(f"\n[Model] {model_name}")
         model_oof = np.zeros(len(X), dtype=float)
-        fold_test_predictions = np.zeros((config.n_splits, len(X_test)), dtype=float)
         fold_scores: list[float] = []
 
         for fold_index, (train_idx, valid_idx) in enumerate(
@@ -493,23 +601,26 @@ def run_cross_validation(
             X_valid = X.iloc[valid_idx]
             y_valid = y.iloc[valid_idx]
 
-            model = build_model(
-                model_name,
-                categorical_columns=categorical_columns,
-                numeric_columns=numeric_columns,
-                seed=config.seed + fold_index,
-            )
-
-            if model_name == "catboost":
-                model.fit(X_train, y_train, cat_features=categorical_columns)
-            else:
-                model.fit(X_train, y_train)
-
-            valid_probabilities = model.predict_proba(X_valid)[:, 1]
-            test_probabilities = model.predict_proba(X_test)[:, 1]
+            valid_probabilities = np.zeros(len(X_valid), dtype=float)
+            for bagging_seed in config.bagging_seeds:
+                model = build_model(
+                    model_name,
+                    categorical_columns=categorical_columns,
+                    numeric_columns=numeric_columns,
+                    seed=bagging_seed + fold_index,
+                )
+                fit_model(
+                    model_name=model_name,
+                    model=model,
+                    X_train=X_train,
+                    y_train=y_train,
+                    categorical_columns=categorical_columns,
+                )
+                valid_probabilities += (
+                    model.predict_proba(X_valid)[:, 1] / len(config.bagging_seeds)
+                )
 
             model_oof[valid_idx] = valid_probabilities
-            fold_test_predictions[fold_index - 1] = test_probabilities
 
             fold_threshold, fold_accuracy = search_best_threshold(
                 y_valid.to_numpy(), valid_probabilities, thresholds
@@ -524,19 +635,59 @@ def run_cross_validation(
             y.to_numpy(), model_oof, thresholds
         )
         oof_predictions[model_name] = model_oof
-        test_predictions[model_name] = fold_test_predictions.mean(axis=0)
         metrics[model_name] = {
             "oof_accuracy": float(best_accuracy),
             "best_threshold": float(best_threshold),
             "mean_fold_accuracy": float(np.mean(fold_scores)),
             "std_fold_accuracy": float(np.std(fold_scores)),
+            "bagging_seed_count": len(config.bagging_seeds),
         }
         print(
             f"[OOF] {model_name}: accuracy={best_accuracy:.5f}, "
             f"threshold={best_threshold:.2f}"
         )
 
-    return oof_predictions, test_predictions, metrics
+    return oof_predictions, metrics
+
+
+def fit_full_ensemble_predictions(
+    X: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    categorical_columns: list[str],
+    numeric_columns: list[str],
+    config: RunConfig,
+    sample_weight: np.ndarray | None = None,
+    log_prefix: str = "[Full Train]",
+) -> dict[str, np.ndarray]:
+    test_predictions: dict[str, np.ndarray] = {}
+
+    for model_name in config.models:
+        print(f"\n{log_prefix} {model_name}")
+        model_probabilities = np.zeros(len(X_test), dtype=float)
+
+        for bagging_seed in config.bagging_seeds:
+            model = build_model(
+                model_name,
+                categorical_columns=categorical_columns,
+                numeric_columns=numeric_columns,
+                seed=bagging_seed,
+            )
+            fit_model(
+                model_name=model_name,
+                model=model,
+                X_train=X,
+                y_train=y,
+                categorical_columns=categorical_columns,
+                sample_weight=sample_weight,
+            )
+            model_probabilities += (
+                model.predict_proba(X_test)[:, 1] / len(config.bagging_seeds)
+            )
+
+        test_predictions[model_name] = model_probabilities
+
+    return test_predictions
 
 
 def build_submission(
@@ -563,6 +714,54 @@ def build_submission(
     return prediction_df[[id_column, target_column]]
 
 
+def predictions_from_top_k(probabilities: np.ndarray, positive_count: int) -> np.ndarray:
+    positive_count = max(0, min(int(positive_count), len(probabilities)))
+    predictions = np.full(len(probabilities), "no", dtype=object)
+    if positive_count == 0:
+        return predictions
+
+    top_indices = np.argsort(probabilities)[-positive_count:]
+    predictions[top_indices] = "yes"
+    return predictions
+
+
+def build_candidate_submissions(
+    sample_df: pd.DataFrame,
+    test_ids: pd.Series,
+    base_probabilities: np.ndarray,
+    base_threshold: float,
+    base_positive_count: int,
+    candidate_rate_multipliers: tuple[float, ...],
+    pseudo_probabilities: np.ndarray | None = None,
+) -> dict[str, pd.DataFrame]:
+    candidate_frames: dict[str, pd.DataFrame] = {}
+
+    candidate_frames["candidate_all_no.csv"] = build_submission(
+        sample_df=sample_df,
+        test_ids=test_ids,
+        predictions=np.full(len(base_probabilities), "no", dtype=object),
+    )
+
+    for multiplier in candidate_rate_multipliers:
+        candidate_positive_count = int(round(base_positive_count * multiplier))
+        file_name = f"candidate_base_topk_x{multiplier:.2f}.csv"
+        candidate_frames[file_name] = build_submission(
+            sample_df=sample_df,
+            test_ids=test_ids,
+            predictions=predictions_from_top_k(base_probabilities, candidate_positive_count),
+        )
+
+    if pseudo_probabilities is not None:
+        pseudo_predictions = np.where(pseudo_probabilities >= base_threshold, "yes", "no")
+        candidate_frames["candidate_pseudo_label.csv"] = build_submission(
+            sample_df=sample_df,
+            test_ids=test_ids,
+            predictions=pseudo_predictions,
+        )
+
+    return candidate_frames
+
+
 def to_serializable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -580,10 +779,13 @@ def to_serializable(value: Any) -> Any:
 def save_outputs(
     output_dir: Path,
     submission_df: pd.DataFrame,
+    candidate_submissions: dict[str, pd.DataFrame],
     summary: dict[str, Any],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     submission_df.to_csv(output_dir / "submission.csv", index=False)
+    for file_name, candidate_df in candidate_submissions.items():
+        candidate_df.to_csv(output_dir / file_name, index=False)
     with (output_dir / "run_summary.json").open("w", encoding="utf-8") as file:
         json.dump(to_serializable(summary), file, indent=2, ensure_ascii=False)
 
@@ -613,11 +815,11 @@ def main() -> None:
         f"numeric={len(numeric_columns)}, use_duration={config.use_duration}"
     )
     print(f"Models={list(config.models)}")
+    print(f"Bagging seeds={list(config.bagging_seeds)}")
 
-    oof_predictions, test_predictions, model_metrics = run_cross_validation(
+    oof_predictions, model_metrics = run_cross_validation(
         X=X,
         y=y,
-        X_test=X_test,
         categorical_columns=categorical_columns,
         numeric_columns=numeric_columns,
         config=config,
@@ -631,9 +833,16 @@ def main() -> None:
         weight_step=config.weight_step,
     )
 
-    blended_test_probabilities = np.zeros(len(X_test), dtype=float)
-    for model_name, weight in best_weights.items():
-        blended_test_probabilities += weight * test_predictions[model_name]
+    base_test_predictions = fit_full_ensemble_predictions(
+        X=X,
+        y=y,
+        X_test=X_test,
+        categorical_columns=categorical_columns,
+        numeric_columns=numeric_columns,
+        config=config,
+        log_prefix="[Full Train]",
+    )
+    blended_test_probabilities = blend_probabilities(base_test_predictions, best_weights)
 
     final_predictions = np.where(blended_test_probabilities >= best_threshold, "yes", "no")
     submission_df = build_submission(
@@ -641,6 +850,62 @@ def main() -> None:
         test_ids=test_ids,
         predictions=final_predictions,
     )
+    base_positive_count = int((final_predictions == "yes").sum())
+
+    pseudo_probabilities: np.ndarray | None = None
+    pseudo_info: dict[str, Any] = {
+        "enabled": config.enable_pseudo_label,
+        "applied": False,
+        "selected_rows": 0,
+        "weight": config.pseudo_label_weight,
+        "low": config.pseudo_label_low,
+        "high": config.pseudo_label_high,
+    }
+    if config.enable_pseudo_label:
+        pseudo_mask = (
+            (blended_test_probabilities <= config.pseudo_label_low)
+            | (blended_test_probabilities >= config.pseudo_label_high)
+        )
+        pseudo_count = int(pseudo_mask.sum())
+        pseudo_info["selected_rows"] = pseudo_count
+        if pseudo_count > 0:
+            pseudo_labels = (blended_test_probabilities[pseudo_mask] >= 0.5).astype(int)
+            X_augmented = pd.concat(
+                [X, X_test.loc[pseudo_mask].copy()], axis=0, ignore_index=True
+            )
+            y_augmented = pd.concat(
+                [y, pd.Series(pseudo_labels, name=TARGET_COLUMN)], axis=0, ignore_index=True
+            )
+            sample_weight = np.ones(len(X_augmented), dtype=float)
+            sample_weight[len(X) :] = config.pseudo_label_weight
+
+            pseudo_test_predictions = fit_full_ensemble_predictions(
+                X=X_augmented,
+                y=y_augmented,
+                X_test=X_test,
+                categorical_columns=categorical_columns,
+                numeric_columns=numeric_columns,
+                config=config,
+                sample_weight=sample_weight,
+                log_prefix="[Pseudo Label]",
+            )
+            pseudo_probabilities = blend_probabilities(pseudo_test_predictions, best_weights)
+            pseudo_info["applied"] = True
+            pseudo_info["predicted_positive_count"] = int(
+                (pseudo_probabilities >= best_threshold).sum()
+            )
+
+    candidate_submissions: dict[str, pd.DataFrame] = {}
+    if config.export_candidates:
+        candidate_submissions = build_candidate_submissions(
+            sample_df=sample_df,
+            test_ids=test_ids,
+            base_probabilities=blended_test_probabilities,
+            base_threshold=best_threshold,
+            base_positive_count=base_positive_count,
+            candidate_rate_multipliers=config.candidate_rate_multipliers,
+            pseudo_probabilities=pseudo_probabilities,
+        )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = config.output_root / f"submission_{timestamp}"
@@ -657,6 +922,13 @@ def main() -> None:
             "use_duration": config.use_duration,
             "models": config.models,
             "weight_step": config.weight_step,
+            "bagging_seeds": config.bagging_seeds,
+            "export_candidates": config.export_candidates,
+            "candidate_rate_multipliers": config.candidate_rate_multipliers,
+            "enable_pseudo_label": config.enable_pseudo_label,
+            "pseudo_label_low": config.pseudo_label_low,
+            "pseudo_label_high": config.pseudo_label_high,
+            "pseudo_label_weight": config.pseudo_label_weight,
         },
         "dataset": {
             "train_shape": list(train_df.shape),
@@ -675,19 +947,43 @@ def main() -> None:
                 for model_name, weight in best_weights.items()
                 if weight > 0
             },
+            "predicted_positive_count": base_positive_count,
+            "predicted_positive_rate": float(base_positive_count / len(X_test)),
+        },
+        "pseudo_label": pseudo_info,
+        "candidates": {
+            file_name: {
+                "path": output_dir / file_name,
+                "positive_count": int((frame.iloc[:, 1] == "yes").sum()),
+            }
+            for file_name, frame in candidate_submissions.items()
         },
         "artifacts": {
             "submission_path": output_dir / "submission.csv",
             "summary_path": output_dir / "run_summary.json",
         },
     }
-    save_outputs(output_dir=output_dir, submission_df=submission_df, summary=summary)
+    save_outputs(
+        output_dir=output_dir,
+        submission_df=submission_df,
+        candidate_submissions=candidate_submissions,
+        summary=summary,
+    )
 
     print("\n[Ensemble]")
     print(
         f"OOF accuracy={best_accuracy:.5f}, best_threshold={best_threshold:.2f}, "
         f"weights={summary['ensemble']['weights']}"
     )
+    print(
+        f"Primary submission positive_count={base_positive_count}, "
+        f"positive_rate={base_positive_count / len(X_test):.4f}"
+    )
+    if candidate_submissions:
+        print(
+            "Candidate files: "
+            + ", ".join(sorted(candidate_submissions.keys()))
+        )
     print(f"Submission saved to: {output_dir / 'submission.csv'}")
     print(f"Run summary saved to: {output_dir / 'run_summary.json'}")
 
