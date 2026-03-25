@@ -66,6 +66,8 @@ class RunConfig:
     primary_topk_offset: int
     focused_topk_offsets: tuple[int, ...]
     hybrid_pseudo_weights: tuple[float, ...]
+    extra_pseudo_topk_offset: int
+    extra_pseudo_configs: tuple[tuple[float, float, float], ...]
     enable_pseudo_label: bool
     pseudo_label_low: float
     pseudo_label_high: float
@@ -112,13 +114,24 @@ def parse_args() -> RunConfig:
     )
     parser.add_argument(
         "--focused-topk-offsets",
-        default="-3,-2,-1,1,2",
+        default="-4",
         help="Comma separated TopK offsets around the primary positive count.",
     )
     parser.add_argument(
         "--hybrid-pseudo-weights",
-        default="0.90,0.80",
+        default="",
         help="Comma separated pseudo weights for hybrid base/pseudo ranking candidates.",
+    )
+    parser.add_argument(
+        "--extra-pseudo-topk-offset",
+        type=int,
+        default=-2,
+        help="TopK offset applied to extra pseudo variants, relative to the primary positive count.",
+    )
+    parser.add_argument(
+        "--extra-pseudo-configs",
+        default="0.01:0.99:0.30,0.05:0.95:0.25",
+        help="Comma separated pseudo configs as low:high:weight for extra ranking candidates.",
     )
     parser.add_argument(
         "--disable-candidates",
@@ -195,6 +208,25 @@ def parse_args() -> RunConfig:
             if value.strip()
         )
     )
+    extra_pseudo_configs: list[tuple[float, float, float]] = []
+    for raw_config in args.extra_pseudo_configs.split(","):
+        if not raw_config.strip():
+            continue
+        parts = [part.strip() for part in raw_config.split(":")]
+        if len(parts) != 3:
+            raise ValueError(
+                "--extra-pseudo-configs entries must be formatted as low:high:weight."
+            )
+        low, high, weight = map(float, parts)
+        if not 0 <= low < high <= 1:
+            raise ValueError(
+                f"Invalid extra pseudo config {raw_config}: require 0 <= low < high <= 1."
+            )
+        if not 0 < weight <= 1:
+            raise ValueError(
+                f"Invalid extra pseudo config {raw_config}: weight must be in (0, 1]."
+            )
+        extra_pseudo_configs.append((low, high, weight))
     invalid_hybrid_weights = [
         value for value in hybrid_pseudo_weights if not 0 < value < 1
     ]
@@ -229,6 +261,8 @@ def parse_args() -> RunConfig:
         primary_topk_offset=args.primary_topk_offset,
         focused_topk_offsets=focused_topk_offsets,
         hybrid_pseudo_weights=hybrid_pseudo_weights,
+        extra_pseudo_topk_offset=args.extra_pseudo_topk_offset,
+        extra_pseudo_configs=tuple(extra_pseudo_configs),
         enable_pseudo_label=not args.disable_pseudo_label,
         pseudo_label_low=args.pseudo_label_low,
         pseudo_label_high=args.pseudo_label_high,
@@ -719,6 +753,62 @@ def fit_full_ensemble_predictions(
     return test_predictions
 
 
+def format_float_token(value: float) -> str:
+    return f"{value:.2f}".replace(".", "p")
+
+
+def fit_pseudo_label_probabilities(
+    X: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    blended_test_probabilities: np.ndarray,
+    categorical_columns: list[str],
+    numeric_columns: list[str],
+    config: RunConfig,
+    best_weights: dict[str, float],
+    low: float,
+    high: float,
+    weight: float,
+    log_prefix: str,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    pseudo_info: dict[str, Any] = {
+        "applied": False,
+        "selected_rows": 0,
+        "weight": weight,
+        "low": low,
+        "high": high,
+    }
+    pseudo_mask = (blended_test_probabilities <= low) | (
+        blended_test_probabilities >= high
+    )
+    pseudo_count = int(pseudo_mask.sum())
+    pseudo_info["selected_rows"] = pseudo_count
+    if pseudo_count == 0:
+        return None, pseudo_info
+
+    pseudo_labels = (blended_test_probabilities[pseudo_mask] >= 0.5).astype(int)
+    X_augmented = pd.concat([X, X_test.loc[pseudo_mask].copy()], axis=0, ignore_index=True)
+    y_augmented = pd.concat(
+        [y, pd.Series(pseudo_labels, name=TARGET_COLUMN)], axis=0, ignore_index=True
+    )
+    sample_weight = np.ones(len(X_augmented), dtype=float)
+    sample_weight[len(X) :] = weight
+
+    pseudo_test_predictions = fit_full_ensemble_predictions(
+        X=X_augmented,
+        y=y_augmented,
+        X_test=X_test,
+        categorical_columns=categorical_columns,
+        numeric_columns=numeric_columns,
+        config=config,
+        sample_weight=sample_weight,
+        log_prefix=log_prefix,
+    )
+    pseudo_probabilities = blend_probabilities(pseudo_test_predictions, best_weights)
+    pseudo_info["applied"] = True
+    return pseudo_probabilities, pseudo_info
+
+
 def build_submission(
     sample_df: pd.DataFrame, test_ids: pd.Series, predictions: np.ndarray
 ) -> pd.DataFrame:
@@ -790,24 +880,12 @@ def build_candidate_submissions(
     primary_positive_count: int,
     focused_topk_offsets: tuple[int, ...],
     hybrid_pseudo_weights: tuple[float, ...],
+    extra_probability_positive_count: int,
+    extra_probability_sources: dict[str, np.ndarray],
     pseudo_probabilities: np.ndarray | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, Any]]]:
     candidate_frames: dict[str, pd.DataFrame] = {}
     candidate_details: dict[str, dict[str, Any]] = {}
-
-    add_candidate_submission(
-        candidate_frames=candidate_frames,
-        candidate_details=candidate_details,
-        file_name=f"candidate_{primary_source}_threshold.csv",
-        sample_df=sample_df,
-        test_ids=test_ids,
-        predictions=predictions_from_top_k(
-            primary_probabilities, source_threshold_positive_count
-        ),
-        strategy="threshold",
-        source=primary_source,
-        score_anchor=source_threshold_positive_count,
-    )
 
     for offset in focused_topk_offsets:
         candidate_positive_count = primary_positive_count + offset
@@ -848,6 +926,21 @@ def build_candidate_submissions(
                 source=f"hybrid_pseudo_{pseudo_weight:.2f}",
                 score_anchor=primary_positive_count,
             )
+
+    for source_name, source_probabilities in extra_probability_sources.items():
+        add_candidate_submission(
+            candidate_frames=candidate_frames,
+            candidate_details=candidate_details,
+            file_name=f"candidate_{source_name}.csv",
+            sample_df=sample_df,
+            test_ids=test_ids,
+            predictions=predictions_from_top_k(
+                source_probabilities, extra_probability_positive_count
+            ),
+            strategy="topk",
+            source=source_name,
+            score_anchor=extra_probability_positive_count,
+        )
 
     return candidate_frames, candidate_details
 
@@ -948,39 +1041,62 @@ def main() -> None:
         "low": config.pseudo_label_low,
         "high": config.pseudo_label_high,
     }
+    extra_pseudo_candidates: dict[str, np.ndarray] = {}
     if config.enable_pseudo_label:
-        pseudo_mask = (
-            (blended_test_probabilities <= config.pseudo_label_low)
-            | (blended_test_probabilities >= config.pseudo_label_high)
+        pseudo_probabilities, fitted_pseudo_info = fit_pseudo_label_probabilities(
+            X=X,
+            y=y,
+            X_test=X_test,
+            blended_test_probabilities=blended_test_probabilities,
+            categorical_columns=categorical_columns,
+            numeric_columns=numeric_columns,
+            config=config,
+            best_weights=best_weights,
+            low=config.pseudo_label_low,
+            high=config.pseudo_label_high,
+            weight=config.pseudo_label_weight,
+            log_prefix="[Pseudo Label]",
         )
-        pseudo_count = int(pseudo_mask.sum())
-        pseudo_info["selected_rows"] = pseudo_count
-        if pseudo_count > 0:
-            pseudo_labels = (blended_test_probabilities[pseudo_mask] >= 0.5).astype(int)
-            X_augmented = pd.concat(
-                [X, X_test.loc[pseudo_mask].copy()], axis=0, ignore_index=True
-            )
-            y_augmented = pd.concat(
-                [y, pd.Series(pseudo_labels, name=TARGET_COLUMN)], axis=0, ignore_index=True
-            )
-            sample_weight = np.ones(len(X_augmented), dtype=float)
-            sample_weight[len(X) :] = config.pseudo_label_weight
-
-            pseudo_test_predictions = fit_full_ensemble_predictions(
-                X=X_augmented,
-                y=y_augmented,
-                X_test=X_test,
-                categorical_columns=categorical_columns,
-                numeric_columns=numeric_columns,
-                config=config,
-                sample_weight=sample_weight,
-                log_prefix="[Pseudo Label]",
-            )
-            pseudo_probabilities = blend_probabilities(pseudo_test_predictions, best_weights)
-            pseudo_info["applied"] = True
+        pseudo_info.update(fitted_pseudo_info)
+        if pseudo_probabilities is not None:
             pseudo_info["predicted_positive_count"] = int(
                 (pseudo_probabilities >= best_threshold).sum()
             )
+        for low, high, weight in config.extra_pseudo_configs:
+            if (
+                low == config.pseudo_label_low
+                and high == config.pseudo_label_high
+                and weight == config.pseudo_label_weight
+            ):
+                continue
+            variant_probabilities, variant_info = fit_pseudo_label_probabilities(
+                X=X,
+                y=y,
+                X_test=X_test,
+                blended_test_probabilities=blended_test_probabilities,
+                categorical_columns=categorical_columns,
+                numeric_columns=numeric_columns,
+                config=config,
+                best_weights=best_weights,
+                low=low,
+                high=high,
+                weight=weight,
+                log_prefix=(
+                    "[Pseudo Variant "
+                    f"l{format_float_token(low)}_"
+                    f"h{format_float_token(high)}_"
+                    f"w{format_float_token(weight)}]"
+                ),
+            )
+            if variant_probabilities is None or not variant_info["applied"]:
+                continue
+            source_name = (
+                "pseudo_variant_"
+                f"l{format_float_token(low)}_"
+                f"h{format_float_token(high)}_"
+                f"w{format_float_token(weight)}"
+            )
+            extra_pseudo_candidates[source_name] = variant_probabilities
 
     primary_probabilities = blended_test_probabilities
     primary_source = "base"
@@ -995,6 +1111,13 @@ def main() -> None:
     source_threshold_positive_count = int((primary_probabilities >= best_threshold).sum())
     primary_positive_count = max(
         0, min(len(X_test), source_threshold_positive_count + config.primary_topk_offset)
+    )
+    extra_probability_positive_count = max(
+        0,
+        min(
+            len(X_test),
+            primary_positive_count + config.extra_pseudo_topk_offset,
+        ),
     )
     primary_predictions = predictions_from_top_k(
         primary_probabilities, primary_positive_count
@@ -1019,6 +1142,8 @@ def main() -> None:
             primary_positive_count=primary_positive_count,
             focused_topk_offsets=config.focused_topk_offsets,
             hybrid_pseudo_weights=config.hybrid_pseudo_weights,
+            extra_probability_positive_count=extra_probability_positive_count,
+            extra_probability_sources=extra_pseudo_candidates,
             pseudo_probabilities=pseudo_probabilities,
         )
 
@@ -1043,6 +1168,8 @@ def main() -> None:
             "primary_topk_offset": config.primary_topk_offset,
             "focused_topk_offsets": config.focused_topk_offsets,
             "hybrid_pseudo_weights": config.hybrid_pseudo_weights,
+            "extra_pseudo_topk_offset": config.extra_pseudo_topk_offset,
+            "extra_pseudo_configs": config.extra_pseudo_configs,
             "enable_pseudo_label": config.enable_pseudo_label,
             "pseudo_label_low": config.pseudo_label_low,
             "pseudo_label_high": config.pseudo_label_high,
