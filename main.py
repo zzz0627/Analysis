@@ -107,17 +107,17 @@ def parse_args() -> RunConfig:
     parser.add_argument(
         "--primary-topk-offset",
         type=int,
-        default=9,
+        default=8,
         help="Extra positive count added on top of the primary source threshold count.",
     )
     parser.add_argument(
         "--focused-topk-offsets",
-        default="-2,-1,1,2,3,4",
+        default="-3,-2,-1,1,2",
         help="Comma separated TopK offsets around the primary positive count.",
     )
     parser.add_argument(
         "--hybrid-pseudo-weights",
-        default="",
+        default="0.90,0.80",
         help="Comma separated pseudo weights for hybrid base/pseudo ranking candidates.",
     )
     parser.add_argument(
