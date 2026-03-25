@@ -1,0 +1,157 @@
+{
+  "timestamp": "20260325_145917",
+  "config": {
+    "train_path": "dataset/train.csv",
+    "test_path": "dataset/test.csv",
+    "sample_path": "dataset/submission.csv",
+    "output_root": "submission",
+    "n_splits": 5,
+    "seed": 42,
+    "use_duration": true,
+    "models": [
+      "catboost",
+      "lightgbm",
+      "xgboost"
+    ],
+    "weight_step": 0.05,
+    "bagging_seeds": [
+      42,
+      2024,
+      3407
+    ],
+    "export_candidates": true,
+    "primary_source": "pseudo",
+    "primary_topk_offset": 9,
+    "focused_topk_offsets": [
+      -2,
+      -1,
+      1,
+      2,
+      3,
+      4
+    ],
+    "hybrid_pseudo_weights": [],
+    "enable_pseudo_label": true,
+    "pseudo_label_low": 0.02,
+    "pseudo_label_high": 0.98,
+    "pseudo_label_weight": 0.35
+  },
+  "dataset": {
+    "train_shape": [
+      22500,
+      22
+    ],
+    "test_shape": [
+      7500,
+      21
+    ],
+    "positive_rate": 0.1312,
+    "feature_count": 55,
+    "categorical_count": 17,
+    "numeric_count": 38
+  },
+  "model_metrics": {
+    "catboost": {
+      "oof_accuracy": 0.8842666666666666,
+      "best_threshold": 0.55,
+      "mean_fold_accuracy": 0.8850666666666667,
+      "std_fold_accuracy": 0.0017744413135712931,
+      "bagging_seed_count": 3
+    },
+    "lightgbm": {
+      "oof_accuracy": 0.8848444444444444,
+      "best_threshold": 0.49,
+      "mean_fold_accuracy": 0.8857333333333333,
+      "std_fold_accuracy": 0.003483718745291632,
+      "bagging_seed_count": 3
+    },
+    "xgboost": {
+      "oof_accuracy": 0.8835111111111111,
+      "best_threshold": 0.54,
+      "mean_fold_accuracy": 0.8852444444444444,
+      "std_fold_accuracy": 0.0034300055789466335,
+      "bagging_seed_count": 3
+    }
+  },
+  "ensemble": {
+    "oof_accuracy": 0.8853333333333333,
+    "best_threshold": 0.5,
+    "weights": {
+      "catboost": 0.15,
+      "lightgbm": 0.8,
+      "xgboost": 0.05
+    },
+    "predicted_positive_count": 583,
+    "predicted_positive_rate": 0.07773333333333333
+  },
+  "primary_submission": {
+    "source": "pseudo",
+    "source_threshold_positive_count": 577,
+    "positive_count": 586,
+    "positive_rate": 0.07813333333333333
+  },
+  "pseudo_label": {
+    "enabled": true,
+    "applied": true,
+    "selected_rows": 2666,
+    "weight": 0.35,
+    "low": 0.02,
+    "high": 0.98,
+    "predicted_positive_count": 577
+  },
+  "candidates": {
+    "candidate_pseudo_threshold.csv": {
+      "strategy": "threshold",
+      "source": "pseudo",
+      "positive_count": 577,
+      "score_anchor": 577.0,
+      "path": "submission/submission_20260325_145917/candidate_pseudo_threshold.csv"
+    },
+    "candidate_pseudo_topk_minus2.csv": {
+      "strategy": "topk",
+      "source": "pseudo",
+      "positive_count": 584,
+      "score_anchor": 584.0,
+      "path": "submission/submission_20260325_145917/candidate_pseudo_topk_minus2.csv"
+    },
+    "candidate_pseudo_topk_minus1.csv": {
+      "strategy": "topk",
+      "source": "pseudo",
+      "positive_count": 585,
+      "score_anchor": 585.0,
+      "path": "submission/submission_20260325_145917/candidate_pseudo_topk_minus1.csv"
+    },
+    "candidate_pseudo_topk_plus1.csv": {
+      "strategy": "topk",
+      "source": "pseudo",
+      "positive_count": 587,
+      "score_anchor": 587.0,
+      "path": "submission/submission_20260325_145917/candidate_pseudo_topk_plus1.csv"
+    },
+    "candidate_pseudo_topk_plus2.csv": {
+      "strategy": "topk",
+      "source": "pseudo",
+      "positive_count": 588,
+      "score_anchor": 588.0,
+      "path": "submission/submission_20260325_145917/candidate_pseudo_topk_plus2.csv"
+    },
+    "candidate_pseudo_topk_plus3.csv": {
+      "strategy": "topk",
+      "source": "pseudo",
+      "positive_count": 589,
+      "score_anchor": 589.0,
+      "path": "submission/submission_20260325_145917/candidate_pseudo_topk_plus3.csv"
+    },
+    "candidate_pseudo_topk_plus4.csv": {
+      "strategy": "topk",
+      "source": "pseudo",
+      "positive_count": 590,
+      "score_anchor": 590.0,
+      "path": "submission/submission_20260325_145917/candidate_pseudo_topk_plus4.csv"
+    }
+  },
+  "artifacts": {
+    "submission_path": "submission/submission_20260325_145917/submission.csv",
+    "summary_path": "submission/submission_20260325_145917/run_summary.json"
+  }
+}

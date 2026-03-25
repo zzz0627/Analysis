@@ -63,6 +63,7 @@ class RunConfig:
     bagging_seeds: tuple[int, ...]
     export_candidates: bool
     primary_source: str
+    primary_topk_offset: int
     focused_topk_offsets: tuple[int, ...]
     hybrid_pseudo_weights: tuple[float, ...]
     enable_pseudo_label: bool
@@ -104,13 +105,19 @@ def parse_args() -> RunConfig:
         help="Primary submission source. `pseudo` falls back to `base` if pseudo-labeling is unavailable.",
     )
     parser.add_argument(
+        "--primary-topk-offset",
+        type=int,
+        default=9,
+        help="Extra positive count added on top of the primary source threshold count.",
+    )
+    parser.add_argument(
         "--focused-topk-offsets",
-        default="-18,-9,9,18",
+        default="-2,-1,1,2,3,4",
         help="Comma separated TopK offsets around the primary positive count.",
     )
     parser.add_argument(
         "--hybrid-pseudo-weights",
-        default="0.85,0.70",
+        default="",
         help="Comma separated pseudo weights for hybrid base/pseudo ranking candidates.",
     )
     parser.add_argument(
@@ -219,6 +226,7 @@ def parse_args() -> RunConfig:
         bagging_seeds=bagging_seeds,
         export_candidates=not args.disable_candidates,
         primary_source=args.primary_source,
+        primary_topk_offset=args.primary_topk_offset,
         focused_topk_offsets=focused_topk_offsets,
         hybrid_pseudo_weights=hybrid_pseudo_weights,
         enable_pseudo_label=not args.disable_pseudo_label,
@@ -778,6 +786,7 @@ def build_candidate_submissions(
     primary_probabilities: np.ndarray,
     primary_source: str,
     threshold: float,
+    source_threshold_positive_count: int,
     primary_positive_count: int,
     focused_topk_offsets: tuple[int, ...],
     hybrid_pseudo_weights: tuple[float, ...],
@@ -789,13 +798,15 @@ def build_candidate_submissions(
     add_candidate_submission(
         candidate_frames=candidate_frames,
         candidate_details=candidate_details,
-        file_name="candidate_base_threshold.csv",
+        file_name=f"candidate_{primary_source}_threshold.csv",
         sample_df=sample_df,
         test_ids=test_ids,
-        predictions=np.where(base_probabilities >= threshold, "yes", "no"),
+        predictions=predictions_from_top_k(
+            primary_probabilities, source_threshold_positive_count
+        ),
         strategy="threshold",
-        source="base",
-        score_anchor=threshold,
+        source=primary_source,
+        score_anchor=source_threshold_positive_count,
     )
 
     for offset in focused_topk_offsets:
@@ -923,8 +934,10 @@ def main() -> None:
     )
     blended_test_probabilities = blend_probabilities(base_test_predictions, best_weights)
 
-    base_predictions = np.where(blended_test_probabilities >= best_threshold, "yes", "no")
-    base_positive_count = int((base_predictions == "yes").sum())
+    base_threshold_predictions = np.where(
+        blended_test_probabilities >= best_threshold, "yes", "no"
+    )
+    base_positive_count = int((base_threshold_predictions == "yes").sum())
 
     pseudo_probabilities: np.ndarray | None = None
     pseudo_info: dict[str, Any] = {
@@ -979,8 +992,13 @@ def main() -> None:
         primary_probabilities = pseudo_probabilities
         primary_source = "pseudo"
 
-    primary_predictions = np.where(primary_probabilities >= best_threshold, "yes", "no")
-    primary_positive_count = int((primary_predictions == "yes").sum())
+    source_threshold_positive_count = int((primary_probabilities >= best_threshold).sum())
+    primary_positive_count = max(
+        0, min(len(X_test), source_threshold_positive_count + config.primary_topk_offset)
+    )
+    primary_predictions = predictions_from_top_k(
+        primary_probabilities, primary_positive_count
+    )
     submission_df = build_submission(
         sample_df=sample_df,
         test_ids=test_ids,
@@ -997,6 +1015,7 @@ def main() -> None:
             primary_probabilities=primary_probabilities,
             primary_source=primary_source,
             threshold=best_threshold,
+            source_threshold_positive_count=source_threshold_positive_count,
             primary_positive_count=primary_positive_count,
             focused_topk_offsets=config.focused_topk_offsets,
             hybrid_pseudo_weights=config.hybrid_pseudo_weights,
@@ -1021,6 +1040,7 @@ def main() -> None:
             "bagging_seeds": config.bagging_seeds,
             "export_candidates": config.export_candidates,
             "primary_source": config.primary_source,
+            "primary_topk_offset": config.primary_topk_offset,
             "focused_topk_offsets": config.focused_topk_offsets,
             "hybrid_pseudo_weights": config.hybrid_pseudo_weights,
             "enable_pseudo_label": config.enable_pseudo_label,
@@ -1050,6 +1070,7 @@ def main() -> None:
         },
         "primary_submission": {
             "source": primary_source,
+            "source_threshold_positive_count": source_threshold_positive_count,
             "positive_count": primary_positive_count,
             "positive_rate": float(primary_positive_count / len(X_test)),
         },
@@ -1080,6 +1101,7 @@ def main() -> None:
     )
     print(
         f"Primary submission source={primary_source}, "
+        f"source_threshold_positive_count={source_threshold_positive_count}, "
         f"positive_count={primary_positive_count}, "
         f"positive_rate={primary_positive_count / len(X_test):.4f}"
     )
