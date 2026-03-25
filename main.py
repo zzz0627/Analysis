@@ -62,7 +62,9 @@ class RunConfig:
     weight_step: float
     bagging_seeds: tuple[int, ...]
     export_candidates: bool
-    candidate_rate_multipliers: tuple[float, ...]
+    primary_source: str
+    focused_topk_offsets: tuple[int, ...]
+    hybrid_pseudo_weights: tuple[float, ...]
     enable_pseudo_label: bool
     pseudo_label_low: float
     pseudo_label_high: float
@@ -96,9 +98,20 @@ def parse_args() -> RunConfig:
         help="Comma separated seeds used for model bagging.",
     )
     parser.add_argument(
-        "--candidate-rate-multipliers",
-        default="0.5,0.75,1.25",
-        help="Comma separated positive-count multipliers for leaderboard probing candidates.",
+        "--primary-source",
+        default="pseudo",
+        choices=("pseudo", "base"),
+        help="Primary submission source. `pseudo` falls back to `base` if pseudo-labeling is unavailable.",
+    )
+    parser.add_argument(
+        "--focused-topk-offsets",
+        default="-18,-9,9,18",
+        help="Comma separated TopK offsets around the primary positive count.",
+    )
+    parser.add_argument(
+        "--hybrid-pseudo-weights",
+        default="0.85,0.70",
+        help="Comma separated pseudo weights for hybrid base/pseudo ranking candidates.",
     )
     parser.add_argument(
         "--disable-candidates",
@@ -163,19 +176,25 @@ def parse_args() -> RunConfig:
     if not bagging_seeds:
         raise ValueError("At least one bagging seed must be provided.")
 
-    candidate_rate_multipliers = tuple(
+    focused_topk_offsets = tuple(
+        dict.fromkeys(
+            int(value.strip()) for value in args.focused_topk_offsets.split(",") if value.strip()
+        )
+    )
+    hybrid_pseudo_weights = tuple(
         dict.fromkeys(
             float(value.strip())
-            for value in args.candidate_rate_multipliers.split(",")
+            for value in args.hybrid_pseudo_weights.split(",")
             if value.strip()
         )
     )
-    invalid_multipliers = [
-        value for value in candidate_rate_multipliers if value < 0
+    invalid_hybrid_weights = [
+        value for value in hybrid_pseudo_weights if not 0 < value < 1
     ]
-    if invalid_multipliers:
+    if invalid_hybrid_weights:
         raise ValueError(
-            f"Candidate positive-count multipliers must be non-negative: {invalid_multipliers}"
+            "Hybrid pseudo weights must be strictly between 0 and 1: "
+            f"{invalid_hybrid_weights}"
         )
 
     if not 0 <= args.pseudo_label_low < args.pseudo_label_high <= 1:
@@ -199,7 +218,9 @@ def parse_args() -> RunConfig:
         weight_step=args.weight_step,
         bagging_seeds=bagging_seeds,
         export_candidates=not args.disable_candidates,
-        candidate_rate_multipliers=candidate_rate_multipliers,
+        primary_source=args.primary_source,
+        focused_topk_offsets=focused_topk_offsets,
+        hybrid_pseudo_weights=hybrid_pseudo_weights,
         enable_pseudo_label=not args.disable_pseudo_label,
         pseudo_label_low=args.pseudo_label_low,
         pseudo_label_high=args.pseudo_label_high,
@@ -725,41 +746,99 @@ def predictions_from_top_k(probabilities: np.ndarray, positive_count: int) -> np
     return predictions
 
 
+def add_candidate_submission(
+    candidate_frames: dict[str, pd.DataFrame],
+    candidate_details: dict[str, dict[str, Any]],
+    file_name: str,
+    sample_df: pd.DataFrame,
+    test_ids: pd.Series,
+    predictions: np.ndarray,
+    strategy: str,
+    source: str,
+    score_anchor: float | None = None,
+) -> None:
+    candidate_frames[file_name] = build_submission(
+        sample_df=sample_df,
+        test_ids=test_ids,
+        predictions=predictions,
+    )
+    candidate_details[file_name] = {
+        "strategy": strategy,
+        "source": source,
+        "positive_count": int((predictions == "yes").sum()),
+    }
+    if score_anchor is not None:
+        candidate_details[file_name]["score_anchor"] = float(score_anchor)
+
+
 def build_candidate_submissions(
     sample_df: pd.DataFrame,
     test_ids: pd.Series,
     base_probabilities: np.ndarray,
-    base_threshold: float,
-    base_positive_count: int,
-    candidate_rate_multipliers: tuple[float, ...],
+    primary_probabilities: np.ndarray,
+    primary_source: str,
+    threshold: float,
+    primary_positive_count: int,
+    focused_topk_offsets: tuple[int, ...],
+    hybrid_pseudo_weights: tuple[float, ...],
     pseudo_probabilities: np.ndarray | None = None,
-) -> dict[str, pd.DataFrame]:
+) -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, Any]]]:
     candidate_frames: dict[str, pd.DataFrame] = {}
+    candidate_details: dict[str, dict[str, Any]] = {}
 
-    candidate_frames["candidate_all_no.csv"] = build_submission(
+    add_candidate_submission(
+        candidate_frames=candidate_frames,
+        candidate_details=candidate_details,
+        file_name="candidate_base_threshold.csv",
         sample_df=sample_df,
         test_ids=test_ids,
-        predictions=np.full(len(base_probabilities), "no", dtype=object),
+        predictions=np.where(base_probabilities >= threshold, "yes", "no"),
+        strategy="threshold",
+        source="base",
+        score_anchor=threshold,
     )
 
-    for multiplier in candidate_rate_multipliers:
-        candidate_positive_count = int(round(base_positive_count * multiplier))
-        file_name = f"candidate_base_topk_x{multiplier:.2f}.csv"
-        candidate_frames[file_name] = build_submission(
+    for offset in focused_topk_offsets:
+        candidate_positive_count = primary_positive_count + offset
+        offset_label = f"plus{offset}" if offset > 0 else f"minus{abs(offset)}"
+        file_name = f"candidate_{primary_source}_topk_{offset_label}.csv"
+        add_candidate_submission(
+            candidate_frames=candidate_frames,
+            candidate_details=candidate_details,
+            file_name=file_name,
             sample_df=sample_df,
             test_ids=test_ids,
-            predictions=predictions_from_top_k(base_probabilities, candidate_positive_count),
+            predictions=predictions_from_top_k(
+                primary_probabilities, candidate_positive_count
+            ),
+            strategy="topk",
+            source=primary_source,
+            score_anchor=candidate_positive_count,
         )
 
     if pseudo_probabilities is not None:
-        pseudo_predictions = np.where(pseudo_probabilities >= base_threshold, "yes", "no")
-        candidate_frames["candidate_pseudo_label.csv"] = build_submission(
-            sample_df=sample_df,
-            test_ids=test_ids,
-            predictions=pseudo_predictions,
-        )
+        for pseudo_weight in hybrid_pseudo_weights:
+            hybrid_probabilities = (
+                pseudo_weight * pseudo_probabilities
+                + (1.0 - pseudo_weight) * base_probabilities
+            )
+            weight_label = f"{pseudo_weight:.2f}".replace(".", "p")
+            file_name = f"candidate_hybrid_pseudo_{weight_label}.csv"
+            add_candidate_submission(
+                candidate_frames=candidate_frames,
+                candidate_details=candidate_details,
+                file_name=file_name,
+                sample_df=sample_df,
+                test_ids=test_ids,
+                predictions=predictions_from_top_k(
+                    hybrid_probabilities, primary_positive_count
+                ),
+                strategy="topk",
+                source=f"hybrid_pseudo_{pseudo_weight:.2f}",
+                score_anchor=primary_positive_count,
+            )
 
-    return candidate_frames
+    return candidate_frames, candidate_details
 
 
 def to_serializable(value: Any) -> Any:
@@ -844,13 +923,8 @@ def main() -> None:
     )
     blended_test_probabilities = blend_probabilities(base_test_predictions, best_weights)
 
-    final_predictions = np.where(blended_test_probabilities >= best_threshold, "yes", "no")
-    submission_df = build_submission(
-        sample_df=sample_df,
-        test_ids=test_ids,
-        predictions=final_predictions,
-    )
-    base_positive_count = int((final_predictions == "yes").sum())
+    base_predictions = np.where(blended_test_probabilities >= best_threshold, "yes", "no")
+    base_positive_count = int((base_predictions == "yes").sum())
 
     pseudo_probabilities: np.ndarray | None = None
     pseudo_info: dict[str, Any] = {
@@ -895,15 +969,37 @@ def main() -> None:
                 (pseudo_probabilities >= best_threshold).sum()
             )
 
+    primary_probabilities = blended_test_probabilities
+    primary_source = "base"
+    if (
+        config.primary_source == "pseudo"
+        and pseudo_probabilities is not None
+        and pseudo_info["applied"]
+    ):
+        primary_probabilities = pseudo_probabilities
+        primary_source = "pseudo"
+
+    primary_predictions = np.where(primary_probabilities >= best_threshold, "yes", "no")
+    primary_positive_count = int((primary_predictions == "yes").sum())
+    submission_df = build_submission(
+        sample_df=sample_df,
+        test_ids=test_ids,
+        predictions=primary_predictions,
+    )
+
     candidate_submissions: dict[str, pd.DataFrame] = {}
+    candidate_details: dict[str, dict[str, Any]] = {}
     if config.export_candidates:
-        candidate_submissions = build_candidate_submissions(
+        candidate_submissions, candidate_details = build_candidate_submissions(
             sample_df=sample_df,
             test_ids=test_ids,
             base_probabilities=blended_test_probabilities,
-            base_threshold=best_threshold,
-            base_positive_count=base_positive_count,
-            candidate_rate_multipliers=config.candidate_rate_multipliers,
+            primary_probabilities=primary_probabilities,
+            primary_source=primary_source,
+            threshold=best_threshold,
+            primary_positive_count=primary_positive_count,
+            focused_topk_offsets=config.focused_topk_offsets,
+            hybrid_pseudo_weights=config.hybrid_pseudo_weights,
             pseudo_probabilities=pseudo_probabilities,
         )
 
@@ -924,7 +1020,9 @@ def main() -> None:
             "weight_step": config.weight_step,
             "bagging_seeds": config.bagging_seeds,
             "export_candidates": config.export_candidates,
-            "candidate_rate_multipliers": config.candidate_rate_multipliers,
+            "primary_source": config.primary_source,
+            "focused_topk_offsets": config.focused_topk_offsets,
+            "hybrid_pseudo_weights": config.hybrid_pseudo_weights,
             "enable_pseudo_label": config.enable_pseudo_label,
             "pseudo_label_low": config.pseudo_label_low,
             "pseudo_label_high": config.pseudo_label_high,
@@ -950,13 +1048,18 @@ def main() -> None:
             "predicted_positive_count": base_positive_count,
             "predicted_positive_rate": float(base_positive_count / len(X_test)),
         },
+        "primary_submission": {
+            "source": primary_source,
+            "positive_count": primary_positive_count,
+            "positive_rate": float(primary_positive_count / len(X_test)),
+        },
         "pseudo_label": pseudo_info,
         "candidates": {
             file_name: {
+                **candidate_details[file_name],
                 "path": output_dir / file_name,
-                "positive_count": int((frame.iloc[:, 1] == "yes").sum()),
             }
-            for file_name, frame in candidate_submissions.items()
+            for file_name in candidate_submissions
         },
         "artifacts": {
             "submission_path": output_dir / "submission.csv",
@@ -976,8 +1079,9 @@ def main() -> None:
         f"weights={summary['ensemble']['weights']}"
     )
     print(
-        f"Primary submission positive_count={base_positive_count}, "
-        f"positive_rate={base_positive_count / len(X_test):.4f}"
+        f"Primary submission source={primary_source}, "
+        f"positive_count={primary_positive_count}, "
+        f"positive_rate={primary_positive_count / len(X_test):.4f}"
     )
     if candidate_submissions:
         print(
