@@ -839,7 +839,64 @@ def predictions_from_top_k(probabilities: np.ndarray, positive_count: int) -> np
     if positive_count == 0:
         return predictions
 
-    top_indices = np.argsort(probabilities)[-positive_count:]
+    top_indices = np.argsort(probabilities, kind="mergesort")[-positive_count:]
+    predictions[top_indices] = "yes"
+    return predictions
+
+
+def rank_probabilities(probabilities: np.ndarray) -> np.ndarray:
+    if len(probabilities) == 0:
+        return np.array([], dtype=float)
+
+    order = np.argsort(probabilities, kind="mergesort")
+    rank_scores = np.empty(len(probabilities), dtype=float)
+    rank_scores[order] = np.arange(len(probabilities), dtype=float)
+    if len(probabilities) > 1:
+        rank_scores /= len(probabilities) - 1
+    return rank_scores
+
+
+def average_rank_probabilities(
+    probability_sources: dict[str, np.ndarray]
+) -> np.ndarray:
+    if not probability_sources:
+        raise ValueError("At least one probability source is required for rank averaging.")
+
+    averaged_ranks = np.zeros_like(
+        next(iter(probability_sources.values())),
+        dtype=float,
+    )
+    for source_probabilities in probability_sources.values():
+        averaged_ranks += rank_probabilities(source_probabilities)
+    return averaged_ranks / len(probability_sources)
+
+
+def predictions_from_consensus_top_k(
+    probability_sources: dict[str, np.ndarray],
+    positive_count: int,
+    tie_breaker: np.ndarray,
+) -> np.ndarray:
+    positive_count = max(0, min(int(positive_count), len(tie_breaker)))
+    predictions = np.full(len(tie_breaker), "no", dtype=object)
+    if positive_count == 0:
+        return predictions
+    if not probability_sources:
+        raise ValueError("At least one probability source is required for consensus voting.")
+
+    vote_counts = np.zeros(len(tie_breaker), dtype=int)
+    average_ranks = np.zeros(len(tie_breaker), dtype=float)
+    for source_probabilities in probability_sources.values():
+        source_top_indices = np.argsort(
+            source_probabilities,
+            kind="mergesort",
+        )[-positive_count:]
+        vote_counts[source_top_indices] += 1
+        average_ranks += rank_probabilities(source_probabilities)
+
+    average_ranks /= len(probability_sources)
+    tie_breaker_ranks = rank_probabilities(tie_breaker)
+    consensus_order = np.lexsort((tie_breaker_ranks, average_ranks, vote_counts))
+    top_indices = consensus_order[-positive_count:]
     predictions[top_indices] = "yes"
     return predictions
 
@@ -939,6 +996,47 @@ def build_candidate_submissions(
             ),
             strategy="topk",
             source=source_name,
+            score_anchor=extra_probability_positive_count,
+        )
+
+    pseudo_family_sources: dict[str, np.ndarray] = {}
+    if pseudo_probabilities is not None:
+        pseudo_family_sources["pseudo"] = pseudo_probabilities
+    pseudo_family_sources.update(extra_probability_sources)
+    if len(pseudo_family_sources) >= 2:
+        add_candidate_submission(
+            candidate_frames=candidate_frames,
+            candidate_details=candidate_details,
+            file_name="candidate_rankavg_pseudo_family.csv",
+            sample_df=sample_df,
+            test_ids=test_ids,
+            predictions=predictions_from_top_k(
+                average_rank_probabilities(pseudo_family_sources),
+                extra_probability_positive_count,
+            ),
+            strategy="rankavg_topk",
+            source="pseudo_family",
+            score_anchor=extra_probability_positive_count,
+        )
+
+    all_sources: dict[str, np.ndarray] = {"base": base_probabilities}
+    if pseudo_probabilities is not None:
+        all_sources["pseudo"] = pseudo_probabilities
+    all_sources.update(extra_probability_sources)
+    if len(all_sources) >= 2:
+        add_candidate_submission(
+            candidate_frames=candidate_frames,
+            candidate_details=candidate_details,
+            file_name="candidate_vote_all_sources.csv",
+            sample_df=sample_df,
+            test_ids=test_ids,
+            predictions=predictions_from_consensus_top_k(
+                probability_sources=all_sources,
+                positive_count=extra_probability_positive_count,
+                tie_breaker=primary_probabilities,
+            ),
+            strategy="vote_topk",
+            source="all_sources",
             score_anchor=extra_probability_positive_count,
         )
 
